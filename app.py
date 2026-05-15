@@ -1,20 +1,48 @@
 from flask import Flask, request, jsonify
 import requests
+import dns.resolver
+import dns.exception
 import os
 import datetime
+import threading
 
 app = Flask(__name__)
 API_KEY = os.environ.get('API_KEY', '')
 
 # Darmowe źródła do sprawdzania VPN/Proxy/TOR
-# ip-api.com: 45 req/min bez klucza, zwraca proxy/vpn/tor/hosting
-# proxycheck.io: 100 req/dzień bez klucza
-# iphub.info: 1000 req/dzień bez klucza (blok 0=ok, 1=vpn/proxy, 2=residential proxy)
+# ip-api.com:      45 req/min bez klucza
+# proxycheck.io:   100 req/dzień bez klucza
+# iphub.info:      1000 req/dzień bez klucza (opcjonalny klucz IPHUB_KEY)
+# ipinfo.io:       50k req/miesiąc bez klucza
+# db-ip.com:       darmowy, bez klucza, typ sieci
+# TOR exit nodes:  oficjalna lista torproject.org, bez limitu
+# DNSBL:           zen.spamhaus.org, cbl.abuseat.org
 
-IPAPI_URL = "http://ip-api.com/json/{ip}?fields=status,message,proxy,vpn,tor,hosting,isp,org,as,countryCode,country,city"
+IPAPI_URL      = "http://ip-api.com/json/{ip}?fields=status,message,proxy,vpn,tor,hosting,isp,org,as,countryCode,country,city"
 PROXYCHECK_URL = "http://proxycheck.io/v2/{ip}?vpn=1&asn=1"
-IPHUB_URL = "http://v2.api.iphub.info/ip/{ip}"
-IPHUB_KEY = os.environ.get('IPHUB_KEY', '')  # opcjonalny, zwiększa limit
+IPHUB_URL      = "http://v2.api.iphub.info/ip/{ip}"
+IPINFO_URL     = "https://ipinfo.io/{ip}/json"
+DBIP_URL       = "https://api.db-ip.com/v2/free/{ip}"
+TOR_EXIT_URL   = "https://check.torproject.org/torbulkexitlist"
+IPHUB_KEY      = os.environ.get('IPHUB_KEY', '')
+
+# Cache listy TOR – odświeżany co godzinę
+_tor_cache = {"nodes": set(), "updated_at": None}
+_tor_lock = threading.Lock()
+
+
+def get_tor_exit_nodes():
+    with _tor_lock:
+        now = datetime.datetime.utcnow()
+        if _tor_cache["updated_at"] is None or (now - _tor_cache["updated_at"]).seconds > 3600:
+            try:
+                r = requests.get(TOR_EXIT_URL, timeout=10)
+                nodes = set(line.strip() for line in r.text.splitlines() if line.strip() and not line.startswith('#'))
+                _tor_cache["nodes"] = nodes
+                _tor_cache["updated_at"] = now
+            except Exception:
+                pass
+        return _tor_cache["nodes"]
 
 
 @app.before_request
@@ -54,15 +82,12 @@ def check_proxycheck(ip):
     try:
         r = requests.get(PROXYCHECK_URL.format(ip=ip), timeout=5)
         data = r.json()
-        status = data.get('status', '')
-        if status == 'error':
+        if data.get('status') == 'error':
             return {"error": data.get('message', 'unknown error')}
         ip_data = data.get(ip, {})
-        proxy_val = ip_data.get('proxy', 'no')
-        vpn_val = ip_data.get('type', '')
         return {
-            "is_proxy": proxy_val == 'yes',
-            "type": vpn_val,  # np. "VPN", "TOR", "SOCKS5", ""
+            "is_proxy": ip_data.get('proxy', 'no') == 'yes',
+            "type": ip_data.get('type', ''),
             "asn": ip_data.get('asn', ''),
             "provider": ip_data.get('provider', ''),
             "country": ip_data.get('country', ''),
@@ -86,7 +111,7 @@ def check_iphub(ip):
             return {"error": f"HTTP {r.status_code}"}
         data = r.json()
         block = data.get('block', -1)
-        # block: 0 = OK (residential/business), 1 = VPN/proxy (niezalecane), 2 = residential proxy
+        # block: 0=ok, 1=vpn/proxy, 2=residential proxy
         return {
             "block": block,
             "is_vpn_or_proxy": block == 1,
@@ -100,59 +125,143 @@ def check_iphub(ip):
         return {"error": str(e)}
 
 
-def aggregate_risk(ipapi, proxycheck, iphub):
-    """
-    Wylicza risk_score 0-100 i flagę is_suspicious
-    na podstawie wyników z trzech źródeł.
-    """
+def check_ipinfo(ip):
+    try:
+        r = requests.get(IPINFO_URL.format(ip=ip), timeout=5)
+        if r.status_code != 200:
+            return {"error": f"HTTP {r.status_code}"}
+        data = r.json()
+        privacy = data.get('privacy', {})
+        return {
+            "org": data.get('org', ''),
+            "hostname": data.get('hostname', ''),
+            "city": data.get('city', ''),
+            "country": data.get('country', ''),
+            "is_vpn": privacy.get('vpn', False),
+            "is_proxy": privacy.get('proxy', False),
+            "is_tor": privacy.get('tor', False),
+            "is_hosting": privacy.get('hosting', False),
+        }
+    except requests.exceptions.Timeout:
+        return {"error": "timeout"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def check_dbip(ip):
+    try:
+        r = requests.get(DBIP_URL.format(ip=ip), timeout=5)
+        if r.status_code != 200:
+            return {"error": f"HTTP {r.status_code}"}
+        data = r.json()
+        conn_type = data.get('connectionType', '')
+        # connectionType: consumer, business, hosting, education
+        return {
+            "connection_type": conn_type,
+            "is_hosting": conn_type == 'hosting',
+            "isp": data.get('isp', ''),
+            "country_code": data.get('countryCode', ''),
+            "city": data.get('city', ''),
+        }
+    except requests.exceptions.Timeout:
+        return {"error": "timeout"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def check_tor_exit(ip):
+    try:
+        nodes = get_tor_exit_nodes()
+        is_tor = ip in nodes
+        return {
+            "is_tor": is_tor,
+            "nodes_in_cache": len(nodes),
+            "cache_updated_at": _tor_cache["updated_at"].strftime('%Y-%m-%dT%H:%M:%SZ') if _tor_cache["updated_at"] else None,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def check_dnsbl(ip):
+    lists = ['zen.spamhaus.org', 'cbl.abuseat.org']
+    parts = ip.strip().split('.')
+    if len(parts) != 4:
+        return {"error": "IPv6 not supported for DNSBL"}
+    reversed_ip = '.'.join(reversed(parts))
+    results = {}
+    listed_count = 0
+    for bl in lists:
+        try:
+            resolver = dns.resolver.Resolver()
+            resolver.timeout = 3
+            resolver.lifetime = 3
+            answers = resolver.resolve(f"{reversed_ip}.{bl}", 'A')
+            try:
+                txt = resolver.resolve(f"{reversed_ip}.{bl}", 'TXT')
+                reason = str(txt[0]).strip('"')
+            except Exception:
+                reason = ""
+            results[bl] = {"listed": True, "addresses": [str(r) for r in answers], "reason": reason}
+            listed_count += 1
+        except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
+            results[bl] = {"listed": False}
+        except dns.exception.Timeout:
+            results[bl] = {"listed": None, "error": "timeout"}
+        except Exception as e:
+            results[bl] = {"listed": None, "error": str(e)}
+    return {"listed_count": listed_count, "checked": results}
+
+
+def aggregate_risk(ipapi, proxycheck, iphub, ipinfo, dbip, tor_exit, dnsbl):
     score = 0
     flags = []
 
+    def add_flag(flag):
+        if flag not in flags:
+            flags.append(flag)
+
     # ip-api.com
     if isinstance(ipapi, dict) and 'error' not in ipapi:
-        if ipapi.get('is_vpn'):
-            score += 40
-            flags.append('vpn')
-        if ipapi.get('is_proxy'):
-            score += 35
-            flags.append('proxy')
-        if ipapi.get('is_tor'):
-            score += 50
-            flags.append('tor')
-        if ipapi.get('is_hosting'):
-            score += 15
-            flags.append('hosting')
+        if ipapi.get('is_vpn'):     score += 40; add_flag('vpn')
+        if ipapi.get('is_proxy'):   score += 35; add_flag('proxy')
+        if ipapi.get('is_tor'):     score += 50; add_flag('tor')
+        if ipapi.get('is_hosting'): score += 15; add_flag('hosting')
 
     # proxycheck.io
     if isinstance(proxycheck, dict) and 'error' not in proxycheck:
-        if proxycheck.get('is_proxy'):
-            score += 30
-            if 'proxy' not in flags:
-                flags.append('proxy')
+        if proxycheck.get('is_proxy'): score += 30; add_flag('proxy')
         ptype = proxycheck.get('type', '').upper()
-        if ptype == 'TOR' and 'tor' not in flags:
-            score += 40
-            flags.append('tor')
-        elif ptype in ('VPN',) and 'vpn' not in flags:
-            score += 30
-            flags.append('vpn')
+        if ptype == 'TOR':   score += 40; add_flag('tor')
+        elif ptype == 'VPN': score += 30; add_flag('vpn')
 
     # iphub.info
     if isinstance(iphub, dict) and 'error' not in iphub:
-        if iphub.get('is_vpn_or_proxy'):
-            score += 25
-            if 'vpn' not in flags and 'proxy' not in flags:
-                flags.append('vpn_or_proxy')
-        if iphub.get('is_residential_proxy'):
-            score += 20
-            if 'residential_proxy' not in flags:
-                flags.append('residential_proxy')
+        if iphub.get('is_vpn_or_proxy'):      score += 25; add_flag('vpn_or_proxy')
+        if iphub.get('is_residential_proxy'): score += 20; add_flag('residential_proxy')
 
-    risk_score = min(score, 100)
+    # ipinfo.io
+    if isinstance(ipinfo, dict) and 'error' not in ipinfo:
+        if ipinfo.get('is_vpn'):     score += 30; add_flag('vpn')
+        if ipinfo.get('is_proxy'):   score += 25; add_flag('proxy')
+        if ipinfo.get('is_tor'):     score += 45; add_flag('tor')
+        if ipinfo.get('is_hosting'): score += 10; add_flag('hosting')
+
+    # db-ip.com
+    if isinstance(dbip, dict) and 'error' not in dbip:
+        if dbip.get('is_hosting'): score += 10; add_flag('hosting')
+
+    # TOR exit nodes (oficjalna lista torproject.org)
+    if isinstance(tor_exit, dict) and 'error' not in tor_exit:
+        if tor_exit.get('is_tor'): score += 60; add_flag('tor')
+
+    # DNSBL
+    if isinstance(dnsbl, dict) and 'error' not in dnsbl:
+        if dnsbl.get('listed_count', 0) > 0: score += 20; add_flag('blacklisted')
+
     return {
-        "risk_score": risk_score,
-        "is_suspicious": risk_score >= 30,
-        "flags": list(set(flags)),
+        "risk_score": min(score, 100),
+        "is_suspicious": min(score, 100) >= 30,
+        "flags": flags,
     }
 
 
@@ -163,7 +272,15 @@ def index():
         "endpoints": {
             "/check": "Sprawdź IP pod kątem VPN/Proxy/TOR — /check?ip=1.2.3.4&key=KLUCZ"
         },
-        "sources": ["ip-api.com", "proxycheck.io", "iphub.info"]
+        "sources": [
+            "ip-api.com",
+            "proxycheck.io",
+            "iphub.info",
+            "ipinfo.io",
+            "db-ip.com",
+            "torproject.org (exit nodes)",
+            "DNSBL: zen.spamhaus.org, cbl.abuseat.org"
+        ]
     })
 
 
@@ -174,33 +291,59 @@ def check():
     if not ip:
         return jsonify({"error": "Podaj parametr 'ip'"}), 400
 
-    # prosta walidacja formatu IPv4/IPv6
     parts = ip.split('.')
     if len(parts) != 4 or not all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
-        # może IPv6 – przepuść, zewnętrzne API obsłużą błąd
         if ':' not in ip:
             return jsonify({"error": f"Nieprawidłowy adres IP: {ip}"}), 400
 
     checked_at = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
 
-    ipapi_result = check_ipapi(ip)
-    proxycheck_result = check_proxycheck(ip)
-    iphub_result = check_iphub(ip)
+    # Równoległe zapytania do wszystkich źródeł
+    results = {}
 
-    summary = aggregate_risk(ipapi_result, proxycheck_result, iphub_result)
+    def run(key, fn, *args):
+        results[key] = fn(*args)
+
+    threads = [
+        threading.Thread(target=run, args=('ipapi',      check_ipapi,      ip)),
+        threading.Thread(target=run, args=('proxycheck', check_proxycheck, ip)),
+        threading.Thread(target=run, args=('iphub',      check_iphub,      ip)),
+        threading.Thread(target=run, args=('ipinfo',     check_ipinfo,     ip)),
+        threading.Thread(target=run, args=('dbip',       check_dbip,       ip)),
+        threading.Thread(target=run, args=('tor_exit',   check_tor_exit,   ip)),
+        threading.Thread(target=run, args=('dnsbl',      check_dnsbl,      ip)),
+    ]
+    for t in threads: t.start()
+    for t in threads: t.join(timeout=10)
+
+    summary = aggregate_risk(
+        results.get('ipapi', {}),
+        results.get('proxycheck', {}),
+        results.get('iphub', {}),
+        results.get('ipinfo', {}),
+        results.get('dbip', {}),
+        results.get('tor_exit', {}),
+        results.get('dnsbl', {}),
+    )
 
     return jsonify({
         "ip": ip,
         "checked_at": checked_at,
-        "is_vpn": summary["is_suspicious"],
-        "is_proxy": 'proxy' in summary["flags"],
+        "is_vpn": 'vpn' in summary["flags"] or 'vpn_or_proxy' in summary["flags"],
+        "is_proxy": 'proxy' in summary["flags"] or 'vpn_or_proxy' in summary["flags"],
         "is_tor": 'tor' in summary["flags"],
+        "is_hosting": 'hosting' in summary["flags"],
+        "is_blacklisted": 'blacklisted' in summary["flags"],
         "risk_score": summary["risk_score"],
         "flags": summary["flags"],
         "sources": {
-            "ip_api": ipapi_result,
-            "proxycheck": proxycheck_result,
-            "iphub": iphub_result,
+            "ip_api":     results.get('ipapi', {}),
+            "proxycheck": results.get('proxycheck', {}),
+            "iphub":      results.get('iphub', {}),
+            "ipinfo":     results.get('ipinfo', {}),
+            "dbip":       results.get('dbip', {}),
+            "tor_exit":   results.get('tor_exit', {}),
+            "dnsbl":      results.get('dnsbl', {}),
         }
     })
 
